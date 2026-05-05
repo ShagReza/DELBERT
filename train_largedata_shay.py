@@ -55,7 +55,7 @@ TEST_PARQUET = "data/test.parquet"
 CHECKPOINT_DIR = "checkpoints"
 PREDICTIONS_CSV = "predictions_test.csv"
 
-FP_TYPES = ["ECFP4", "FCFP6", "ATOMPAIR", "TOPTOR"]
+FP_TYPES = ["ECFP4", "FCFP4", "ATOMPAIR", "TOPTOR"]
 NBITS = 2048
 
 LABEL_CANDIDATES = ["LABEL", "label", "ENRICHED", "enriched", "target", "active", "y"]
