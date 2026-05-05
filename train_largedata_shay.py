@@ -83,7 +83,7 @@ NUM_LABELS = 2
 CLASSIFIER_DROPOUT = 0.1
 CLASSIFIER_POOLING = "mean"
 LOSS_TYPE = "weighted_ce"
-POS_CLASS_WEIGHT = 15.0
+POS_CLASS_WEIGHT = 1.0  # train data is balanced; raise (e.g. 15.0) for imbalanced train sets
 
 # ---------------------------------------------------------------------------
 # Training (paper defaults)
@@ -121,6 +121,8 @@ def detect_label_column(df: pd.DataFrame) -> str:
 
 
 def dense_to_sparse(arr):
+    if isinstance(arr, str):
+        arr = [int(x) for x in arr.split(",") if x]
     arr = np.asarray(arr, dtype=np.int32)
     nz = np.nonzero(arr)[0]
     return nz.tolist(), arr[nz].tolist()
