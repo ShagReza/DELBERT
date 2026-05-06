@@ -8,12 +8,17 @@ scikit-learn>=1.2
 numpy>=1.24
 pandas>=2.0
 scipy>=1.10
+matplotlib>=3.5
 pyyaml>=6.0
 tqdm>=4.60
 wandb>=0.15
 
-# Optional: LoRA finetuning
-# peft>=0.6
+# HuggingFace model download / safetensors loading (used by inference and MODE_B)
+huggingface_hub>=0.20
+safetensors>=0.4
+
+# LoRA finetuning (required by MODE_C in train_largedata_shay.py)
+peft>=0.6
 
 # Optional: baseline models and evaluation
 # lightgbm>=4.0

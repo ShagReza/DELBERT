@@ -36,6 +36,8 @@ Run:
 
 import json
 import os
+import sys
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -46,6 +48,9 @@ import torch.nn.functional as F
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
+    f1_score,
+    precision_score,
+    recall_score,
     roc_auc_score,
 )
 from sklearn.model_selection import train_test_split
@@ -78,15 +83,21 @@ TRAIN_MODE = MODE_A_FROM_SCRATCH
 
 
 # ---------------------------------------------------------------------------
-# Paths
+# Run identity — controls where ALL outputs go
+# Set RUN_NAME to a descriptive label (e.g. "proteinX", "wdr91_modeA_full").
+# All artifacts (checkpoints, predictions, config snapshot, log) are written
+# to runs/<RUN_NAME>/.  Reusing the same RUN_NAME overwrites prior outputs.
+# ---------------------------------------------------------------------------
+RUN_NAME = "default"
+RUNS_DIR = "runs"
+
+# ---------------------------------------------------------------------------
+# Input data paths
 # ---------------------------------------------------------------------------
 TRAIN_PARQUET = "data/train.parquet"
 TEST_PARQUET = "data/test.parquet"
 PRETRAIN_PARQUET = "data/train.parquet"  # MODE_C only — set to a different file
                                          # if you have a separate unlabeled corpus
-CHECKPOINT_DIR = "checkpoints"
-PREDICTIONS_CSV = "predictions_test.csv"
-MLM_CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "mlm_pretrained.pt")
 
 # HuggingFace model ID for MODE_B_FROM_HF
 HF_MODEL_ID = "wanglab/delbert-wdr91"  # or wanglab/delbert-lrrk2, etc.
@@ -98,6 +109,16 @@ HF_MODEL_ID = "wanglab/delbert-wdr91"  # or wanglab/delbert-lrrk2, etc.
 FP_TYPES = ["ECFP4"]
 NBITS = 2048
 LABEL_CANDIDATES = ["LABEL", "label", "ENRICHED", "enriched", "target", "active", "y"]
+
+# Token format for fingerprint tokenization (MODE_A and MODE_C; MODE_B forces count).
+#   "binary": vocab is deterministic 4*nbits + 5 specials. Each active bit becomes
+#             a single token "{FP}_{bit}"; counts are ignored. Fast, no data scan.
+#   "count":  vocab is built by scanning the corpus and keeping all observed
+#             (fp_type, bit, count) triples that appear >= COUNT_MIN_TOKEN_FREQUENCY
+#             times. Each active bit becomes "{FP}_{bit}_{count}". Matches the
+#             paper and the published HF checkpoints; ~5-30K extra tokens.
+TOKEN_FORMAT = "binary"
+COUNT_MIN_TOKEN_FREQUENCY = 1
 
 # ---------------------------------------------------------------------------
 # Architecture (paper defaults: ~70M params)
@@ -154,14 +175,150 @@ EARLY_STOP_MIN_DELTA = 0.001
 MONITOR_METRIC = "pr_auc"  # 'pr_auc' or 'roc_auc'
 
 # MLM Stage 1 (MODE_C only)
-MLM_NUM_EPOCHS = 5
+MLM_NUM_EPOCHS = 100
 MLM_BATCH_SIZE = 50
 MLM_LEARNING_RATE = 5e-4
 MLM_PROBABILITY = 0.15
 MLM_VAL_FRACTION = 0.05
 
+# Span-shuffle augmentation — randomly permutes the order of fingerprint-type
+# spans within a sample (segment_ids stay attached to their tokens). Forces
+# the encoder to rely on segment embeddings rather than absolute position.
+# Applied in both classifier and MLM training when > 0.
+# Paper uses 0.3 during MLM pretraining only.  Default 0.0 = disabled.
+SPAN_SHUFFLE_PROBABILITY = 0.0
+
 # Mixed precision (GPU only — paper uses bf16-mixed)
 USE_BF16_ON_GPU = True
+
+# Top-K used for area / weighted ranking metrics in results.csv
+AREA_HITS_K = 500
+
+
+# ===========================================================================
+# Run setup — output folder, config snapshot, log capture
+# ===========================================================================
+
+def get_run_dir() -> str:
+    """Return runs/<RUN_NAME> path (does not create it)."""
+    return os.path.join(RUNS_DIR, RUN_NAME)
+
+
+class _Tee:
+    """Duplicate writes to two streams (e.g. stdout AND a log file)."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+            s.flush()
+
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
+
+def _collect_settings() -> dict:
+    """Snapshot of every hard-coded constant — saved to config.json."""
+    return {
+        "run_name": RUN_NAME,
+        "runs_dir": RUNS_DIR,
+        "train_mode": TRAIN_MODE,
+        "paths": {
+            "train_parquet": TRAIN_PARQUET,
+            "test_parquet": TEST_PARQUET,
+            "pretrain_parquet": PRETRAIN_PARQUET,
+        },
+        "hf_model_id": HF_MODEL_ID,
+        "fingerprints": {
+            "fp_types": FP_TYPES,
+            "nbits": NBITS,
+            "token_format": TOKEN_FORMAT,
+            "count_min_token_frequency": COUNT_MIN_TOKEN_FREQUENCY,
+        },
+        "label_candidates": LABEL_CANDIDATES,
+        "architecture": {
+            "hidden_size": HIDDEN_SIZE,
+            "num_hidden_layers": NUM_HIDDEN_LAYERS,
+            "num_attention_heads": NUM_ATTENTION_HEADS,
+            "intermediate_size": INTERMEDIATE_SIZE,
+            "max_position_embeddings": MAX_POSITION_EMBEDDINGS,
+            "global_rope_theta": GLOBAL_ROPE_THETA,
+            "local_attention": LOCAL_ATTENTION,
+            "hidden_dropout_prob": HIDDEN_DROPOUT_PROB,
+            "attention_probs_dropout_prob": ATTENTION_DROPOUT_PROB,
+            "use_segment_embeddings": USE_SEGMENT_EMBEDDINGS,
+        },
+        "classification_head": {
+            "num_labels": NUM_LABELS,
+            "classifier_dropout": CLASSIFIER_DROPOUT,
+            "classifier_pooling": CLASSIFIER_POOLING,
+            "pos_class_weight": POS_CLASS_WEIGHT,
+        },
+        "lora": {
+            "r": LORA_R,
+            "lora_alpha": LORA_ALPHA,
+            "lora_dropout": LORA_DROPOUT,
+            "target_modules": LORA_TARGET_MODULES,
+        },
+        "training": {
+            "seed": SEED,
+            "num_epochs": NUM_EPOCHS,
+            "batch_size": BATCH_SIZE,
+            "learning_rate": LEARNING_RATE,
+            "weight_decay": WEIGHT_DECAY,
+            "warmup_ratio": WARMUP_RATIO,
+            "gradient_clip_val": GRADIENT_CLIP_VAL,
+            "num_workers": NUM_WORKERS,
+        },
+        "validation_early_stopping": {
+            "val_fraction": VAL_FRACTION,
+            "early_stop_patience": EARLY_STOP_PATIENCE,
+            "early_stop_min_delta": EARLY_STOP_MIN_DELTA,
+            "monitor_metric": MONITOR_METRIC,
+        },
+        "mlm_stage1": {
+            "num_epochs": MLM_NUM_EPOCHS,
+            "batch_size": MLM_BATCH_SIZE,
+            "learning_rate": MLM_LEARNING_RATE,
+            "mlm_probability": MLM_PROBABILITY,
+            "mlm_val_fraction": MLM_VAL_FRACTION,
+        },
+        "augmentation": {
+            "span_shuffle_probability": SPAN_SHUFFLE_PROBABILITY,
+        },
+        "mixed_precision": {"use_bf16_on_gpu": USE_BF16_ON_GPU},
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def setup_run() -> str:
+    """
+    Create runs/<RUN_NAME>/, write config.json, and tee stdout/stderr to
+    training_log.txt inside it. Returns the run directory path.
+
+    Re-running with the same RUN_NAME overwrites prior contents.
+    """
+    run_dir = get_run_dir()
+    os.makedirs(run_dir, exist_ok=True)
+
+    # Save settings snapshot
+    config_path = os.path.join(run_dir, "config.json")
+    with open(config_path, "w") as f:
+        json.dump(_collect_settings(), f, indent=2)
+
+    # Tee stdout + stderr to log file (line-buffered)
+    log_path = os.path.join(run_dir, "training_log.txt")
+    log_file = open(log_path, "w", buffering=1)
+    sys.stdout = _Tee(sys.__stdout__, log_file)
+    sys.stderr = _Tee(sys.__stderr__, log_file)
+
+    print(f"Run directory: {run_dir}")
+    print(f"Config snapshot: {config_path}")
+    print(f"Log file: {log_path}")
+    return run_dir
 
 
 # ===========================================================================
@@ -283,11 +440,316 @@ def evaluate_classifier(model, loader, device, autocast_dtype):
 
 
 # ===========================================================================
+# Diagnostic plots — hit / enrichment / p-value curves
+# ===========================================================================
+# Adapted from a parallel LightGBM/baseline pipeline. Inputs are aligned
+# arrays (labels, probs); we sort internally and write PNGs to run_dir.
+
+# X-axis caps for top-of-ranking inspection.
+PLOT_X_MAX = 1000               # hit curve & p-value/enrichment x-axis
+PLOT_HIT_Y_MAX = 100            # hit curve y-axis cap
+PLOT_N_RANDOM_RUNS = 10         # simulated random permutations on hit curve
+
+
+def _sort_by_score(labels, probs):
+    """Return labels sorted by probs descending (as int8 numpy array)."""
+    labels = np.asarray(labels).astype(np.int8)
+    probs = np.asarray(probs)
+    order = np.argsort(probs)[::-1]
+    return labels[order]
+
+
+def plot_hit_curve(labels, probs, out_path, title=""):
+    """Cumulative-hits curve with theoretical + simulated random baselines."""
+    import matplotlib.pyplot as plt
+    import textwrap
+
+    y_sorted = _sort_by_score(labels, probs)
+    n_total = len(y_sorted)
+    n_pos = int(y_sorted.sum())
+    if n_pos == 0 or n_total == 0:
+        print(f"[hit_curve] No positives or empty data; skipping {out_path}.")
+        return
+
+    ranks = np.arange(1, n_total + 1)
+    cum_hits = np.cumsum(y_sorted)
+    random_curve = ranks * (n_pos / n_total)
+
+    plt.figure(figsize=(8, 6))
+    if PLOT_N_RANDOM_RUNS > 0:
+        rng = np.random.default_rng(42)
+        sim_labels = np.zeros(n_total, dtype=np.int8)
+        sim_labels[:n_pos] = 1
+        for i in range(PLOT_N_RANDOM_RUNS):
+            sim_curve = np.cumsum(rng.permutation(sim_labels))
+            kw = dict(color="lightgray", linewidth=0.8, alpha=0.3)
+            if i == 0:
+                kw["label"] = f"Random simulated ({PLOT_N_RANDOM_RUNS} runs)"
+            plt.plot(ranks, sim_curve, **kw)
+    plt.plot(ranks, random_curve, color="gray", linestyle="--", linewidth=1.5,
+             label="Random expected")
+    plt.plot(ranks, cum_hits, color="darkblue", linewidth=2, label="Model")
+
+    plt.xlabel("K  (top-K predictions)")
+    plt.ylabel("Hit@K  (cumulative true positives)")
+    plt.title(textwrap.fill(f"Hit curve - {title}", width=60), fontsize=10)
+    plt.xlim(0, min(PLOT_X_MAX, n_total))
+    plt.ylim(0, PLOT_HIT_Y_MAX)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200)
+    plt.close()
+    print(f"Saved: {out_path}")
+
+
+def plot_enrichment_curve(labels, probs, out_path, title=""):
+    """Fold-enrichment vs top-n: (k_hits / n_rank) / (K_pos / N_total)."""
+    import matplotlib.pyplot as plt
+    import textwrap
+
+    y_sorted = _sort_by_score(labels, probs)
+    n_total = len(y_sorted)
+    K_pos = int(y_sorted.sum())
+    if K_pos == 0 or n_total == 0:
+        print(f"[enrichment_curve] No positives or empty data; skipping {out_path}.")
+        return
+
+    n_rank = np.arange(1, n_total + 1)
+    k_hits = np.cumsum(y_sorted)
+    enrichment = (k_hits / n_rank) / (K_pos / n_total)
+
+    x_max = min(PLOT_X_MAX, n_total)
+    enr_vis = enrichment[:x_max]
+
+    plt.figure(figsize=(8, 6))
+    plt.plot(n_rank, enrichment, color="darkgreen", linewidth=2, label="Enrichment")
+    plt.axhline(1.0, color="gray", linestyle="--", linewidth=1, label="No enrichment (=1)")
+    plt.xlabel("Top-n")
+    plt.ylabel("Enrichment  (k/n) / (K/N)")
+    plt.title(textwrap.fill(f"Enrichment vs Top-n - {title}", width=60), fontsize=10)
+    plt.xlim(0, x_max)
+    e_min = min(float(np.nanmin(enr_vis)), 1.0)
+    e_max = max(float(np.nanmax(enr_vis)), 1.0)
+    pad = max((e_max - e_min) * 0.10, 0.05)
+    plt.ylim(max(0.0, e_min - pad), e_max + pad)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200)
+    plt.close()
+    print(f"Saved: {out_path}")
+
+
+def plot_pvalue_curve(labels, probs, out_path, title=""):
+    """Hypergeometric -log10(p-value) vs top-n. Higher = more significant."""
+    import matplotlib.pyplot as plt
+    import textwrap
+    from scipy.stats import hypergeom
+
+    y_sorted = _sort_by_score(labels, probs)
+    N_total = len(y_sorted)
+    K_pos = int(y_sorted.sum())
+    if K_pos == 0 or N_total == 0:
+        print(f"[pvalue_curve] No positives or empty data; skipping {out_path}.")
+        return
+
+    n_rank = np.arange(1, N_total + 1)
+    k_hits = np.cumsum(y_sorted)
+    p_values = hypergeom.sf(k_hits - 1, N_total, K_pos, n_rank)
+    p_values = np.clip(p_values, 1e-300, 1.0)
+    neg_log_p = -np.log10(p_values)
+
+    x_max = min(PLOT_X_MAX, N_total)
+    neg_log_p_vis = neg_log_p[:x_max]
+
+    plt.figure(figsize=(8, 6))
+    plt.plot(n_rank, neg_log_p, color="darkblue", linewidth=2, label="-log10(p-value)")
+    plt.axhline(-np.log10(0.05), color="red", linestyle="--", linewidth=1,
+                label="p = 0.05  (-log10 = 1.30)")
+    plt.xlabel("Top-n")
+    plt.ylabel("-log10(p-value)   (higher = more significant)")
+    plt.title(textwrap.fill(f"p-value vs Top-n - {title}", width=60), fontsize=10)
+    plt.xlim(0, x_max)
+    ymin = min(float(np.nanmin(neg_log_p_vis)), -float(np.log10(0.05)))
+    ymax = max(float(np.nanmax(neg_log_p_vis)), -float(np.log10(0.05)))
+    pad = max((ymax - ymin) * 0.05, 0.5)
+    plt.ylim(ymin - pad, ymax + pad)
+    plt.legend()
+    plt.grid(True, which="both", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200)
+    plt.close()
+    print(f"Saved: {out_path}")
+
+
+def make_diagnostic_plots(labels, probs, run_dir, title=""):
+    """Generate hit, enrichment, and p-value plots into run_dir."""
+    plot_hit_curve(labels, probs, os.path.join(run_dir, "hit_curve.png"), title=title)
+    plot_enrichment_curve(labels, probs, os.path.join(run_dir, "enrichment_curve.png"), title=title)
+    plot_pvalue_curve(labels, probs, os.path.join(run_dir, "pvalue_curve.png"), title=title)
+
+
+# ===========================================================================
+# Test metrics table — values written to results.csv
+# Functions lifted from a parallel LightGBM/baseline pipeline so values are
+# directly comparable across model types.
+# ===========================================================================
+
+def hits_and_precision_at_k(y_true, y_pred, y_scores, k):
+    """Count hits in top-k by score where (true=1 AND pred=1). Returns (hits, hits/k)."""
+    k = min(k, len(y_scores))
+    top_k_idx = np.argsort(y_scores)[::-1][:k]
+    top_k_true = np.asarray(y_true)[top_k_idx]
+    top_k_pred = np.asarray(y_pred)[top_k_idx]
+    hits = int(np.sum((top_k_true == 1) & (top_k_pred == 1)))
+    precision_at_k = hits / k if k > 0 else 0.0
+    return hits, precision_at_k
+
+
+def plate_ppv(y, y_pred, top_n: int = 128):
+    """PPV among top_n score-ranked samples whose pred>0.5; mimics a screening plate."""
+    y = np.atleast_1d(np.asarray(y))
+    y_pred = np.atleast_1d(np.asarray(y_pred))
+    stacked = np.vstack((y, y_pred)).T[y_pred.argsort()[::-1]][:top_n, :]
+    stacked = stacked[stacked[:, 1] > 0.5]
+    if len(stacked) == 0:
+        return 0.0
+    return float(np.sum(stacked[:, 0]) / len(stacked))
+
+
+def _ideal_area_hits_at_k(P, K):
+    P = int(P); K = int(K)
+    if P >= K:
+        return K * (K + 1) // 2
+    return P * (P + 1) // 2 + P * (K - P)
+
+
+def area_hits_at_k(y_true, y_score, K):
+    """Σ_{k=1..K} hits@k. Earlier hits weighted more (counted at every k from rank to K)."""
+    K = int(K)
+    if K <= 0 or len(y_true) == 0:
+        return 0
+    K = min(K, len(y_true))
+    order = np.argsort(y_score)[::-1]
+    y_sorted = np.asarray(y_true)[order][:K].astype(int)
+    return int(np.cumsum(y_sorted).sum())
+
+
+def area_hits_at_k_norm(y_true, y_score, K):
+    """area_hits_at_k normalized to [0, 1] by the perfect-ranker maximum."""
+    P = int(np.sum(np.asarray(y_true) == 1))
+    ideal = _ideal_area_hits_at_k(P, K)
+    if ideal == 0:
+        return 0.0
+    return float(area_hits_at_k(y_true, y_score, K) / ideal)
+
+
+def log_weighted_hits_at_k(y_true, y_score, K):
+    """Σ_{k=1..K} cum_hits(k) / log2(k+1). Front-loads early ranks vs. plain area."""
+    K = int(K)
+    if K <= 0 or len(y_true) == 0:
+        return 0.0
+    K = min(K, len(y_true))
+    order = np.argsort(y_score)[::-1]
+    y_sorted = np.asarray(y_true)[order][:K].astype(int)
+    cum = np.cumsum(y_sorted)
+    weights = 1.0 / np.log2(np.arange(1, K + 1) + 1)
+    return float(np.sum(cum * weights))
+
+
+def ndcg_at_k(y_true, y_score, K):
+    """Standard NDCG@K with binary relevance, in [0, 1]."""
+    K = int(K)
+    if K <= 0 or len(y_true) == 0:
+        return 0.0
+    K = min(K, len(y_true))
+    y_arr = np.asarray(y_true).astype(int)
+    P = int(np.sum(y_arr == 1))
+    if P == 0:
+        return 0.0
+    order = np.argsort(y_score)[::-1]
+    y_sorted = y_arr[order][:K]
+    discounts = 1.0 / np.log2(np.arange(1, K + 1) + 1)
+    dcg = float(np.sum(y_sorted * discounts))
+    ideal_K = min(P, K)
+    ideal_dcg = float(np.sum(discounts[:ideal_K]))
+    if ideal_dcg == 0:
+        return 0.0
+    return dcg / ideal_dcg
+
+
+def bedroc_at_k(y_true, y_score, K, alpha=20.0):
+    """BEDROC-style score restricted to top-K, in [0, 1]. Aggressive front-loading."""
+    K = int(K)
+    if K <= 0 or len(y_true) == 0:
+        return 0.0
+    K = min(K, len(y_true))
+    order = np.argsort(y_score)[::-1][:K]
+    y_top = np.asarray(y_true)[order].astype(int)
+    P = int(np.sum(y_top == 1))
+    if P == 0:
+        return 0.0
+    hit_ranks = np.where(y_top == 1)[0] + 1
+    score = float(np.sum(np.exp(-alpha * hit_ranks / K)))
+    ideal = float(np.sum(np.exp(-alpha * np.arange(1, P + 1) / K)))
+    if ideal == 0:
+        return 0.0
+    return score / ideal
+
+
+def compute_test_metrics_table(labels, preds, probs, K=AREA_HITS_K):
+    """Compute all metrics requested for results.csv. Returns dict with Test_ prefix."""
+    y_true = np.asarray(labels)
+    y_pred = np.asarray(preds)
+    y_proba = np.asarray(probs)
+
+    hits_50, _ = hits_and_precision_at_k(y_true, y_pred, y_proba, 50)
+    hits_100, _ = hits_and_precision_at_k(y_true, y_pred, y_proba, 100)
+    hits_200, prec_200 = hits_and_precision_at_k(y_true, y_pred, y_proba, 200)
+    hits_500, prec_500 = hits_and_precision_at_k(y_true, y_pred, y_proba, 500)
+    total_hits = int(np.sum((y_true == 1) & (y_pred == 1)))
+
+    metrics = {
+        "Test_Accuracy": accuracy_score(y_true, y_pred),
+        "Test_Precision": precision_score(y_true, y_pred, zero_division=0),
+        "Test_Recall": recall_score(y_true, y_pred, zero_division=0),
+        "Test_F1Score": f1_score(y_true, y_pred, zero_division=0),
+        "Test_PlatePPV": plate_ppv(y_true, y_pred, top_n=128),
+        "Test_HitsAt50": hits_50,
+        "Test_HitsAt100": hits_100,
+        "Test_HitsAt200": hits_200,
+        "Test_HitsAt500": hits_500,
+        "Test_PrecisionAt200": prec_200,
+        "Test_PrecisionAt500": prec_500,
+        "Test_TotalHits": total_hits,
+        f"Test_AreaHitsAt{K}": area_hits_at_k(y_true, y_proba, K),
+        f"Test_AreaHitsAt{K}_norm": area_hits_at_k_norm(y_true, y_proba, K),
+        f"Test_LogWeightedHitsAt{K}": log_weighted_hits_at_k(y_true, y_proba, K),
+        f"Test_NDCG_at_{K}": ndcg_at_k(y_true, y_proba, K),
+        f"Test_BEDROC_alpha20_at{K}": bedroc_at_k(y_true, y_proba, K, alpha=20.0),
+    }
+    return metrics
+
+
+def save_results_csv(metrics_dict, run_dir):
+    """Write a single-row results.csv with the metrics from compute_test_metrics_table."""
+    out_path = os.path.join(run_dir, "results.csv")
+    pd.DataFrame([metrics_dict]).to_csv(out_path, index=False)
+    print(f"Saved test metrics table to {out_path}")
+    for k, v in metrics_dict.items():
+        if isinstance(v, float):
+            print(f"  {k}: {v:.4f}")
+        else:
+            print(f"  {k}: {v}")
+
+
+# ===========================================================================
 # Tokenizer / model builders
 # ===========================================================================
 
 def build_binary_tokenizer():
-    """Deterministic binary tokenizer used by MODE_A and MODE_C."""
+    """Deterministic binary tokenizer used when TOKEN_FORMAT == 'binary'."""
     vocab_data = build_binary_vocabulary(FP_TYPES, nbits=NBITS)
     tokenizer = create_molecular_tokenizer(
         vocabulary=vocab_data["token_to_id"],
@@ -296,6 +758,75 @@ def build_binary_tokenizer():
         fingerprint_nbits=NBITS,
     )
     return tokenizer
+
+
+def build_count_vocabulary_from_dataframe(df, fp_types, nbits, min_frequency=1):
+    """Scan a pandas DataFrame to build a count-mode vocabulary.
+
+    Counts every (fp_type, bit, count) triple that appears, keeps the ones with
+    frequency >= min_frequency, sorts deterministically, and adds the 5 special
+    tokens. Returns a dict in the format expected by create_molecular_tokenizer.
+    """
+    from collections import Counter
+    counter = Counter()
+    for i in range(len(df)):
+        row = df.iloc[i]
+        for fp in fp_types:
+            indices, values = dense_to_sparse(row[fp])
+            for idx, count in zip(indices, values):
+                if count > 0 and idx < nbits:
+                    counter[f"{fp}_{idx}_{count}"] += 1
+
+    filtered = {tok: c for tok, c in counter.items() if c >= min_frequency}
+    vocab_tokens = sorted(filtered.keys())
+    token_to_id = {tok: i for i, tok in enumerate(vocab_tokens)}
+    for special in ("<unk>", "<pad>", "<mask>", "<cls>", "<sep>"):
+        if special not in token_to_id:
+            token_to_id[special] = len(token_to_id)
+
+    return {
+        "token_to_id": token_to_id,
+        "id_to_token": {v: k for k, v in token_to_id.items()},
+        "vocab_size": len(token_to_id),
+        "token_counts": filtered,
+    }
+
+
+def build_count_tokenizer(df, min_frequency=None):
+    """Count-mode tokenizer built from `df` (typically the train/pretrain corpus)."""
+    if min_frequency is None:
+        min_frequency = COUNT_MIN_TOKEN_FREQUENCY
+    print(
+        f"Building count vocabulary from {len(df):,} molecules "
+        f"(min_frequency={min_frequency})..."
+    )
+    vocab_data = build_count_vocabulary_from_dataframe(
+        df, FP_TYPES, NBITS, min_frequency=min_frequency
+    )
+    print(f"Count vocab built: {vocab_data['vocab_size']:,} tokens "
+          f"({len(vocab_data['token_counts']):,} non-special).")
+    tokenizer = create_molecular_tokenizer(
+        vocabulary=vocab_data["token_to_id"],
+        fingerprint_types=FP_TYPES,
+        token_format="count",
+        fingerprint_nbits=NBITS,
+    )
+    return tokenizer
+
+
+def build_tokenizer_for_mode(df_for_count_vocab=None):
+    """Dispatcher honoring TOKEN_FORMAT. For 'count', df_for_count_vocab is required."""
+    if TOKEN_FORMAT == "binary":
+        return build_binary_tokenizer()
+    if TOKEN_FORMAT == "count":
+        if df_for_count_vocab is None:
+            raise ValueError(
+                "TOKEN_FORMAT='count' requires a DataFrame to scan for vocab."
+            )
+        return build_count_tokenizer(df_for_count_vocab)
+    raise ValueError(
+        f"Unknown TOKEN_FORMAT={TOKEN_FORMAT!r}. Choose 'binary' or 'count'."
+    )
 
 
 def build_classifier_from_scratch(vocab_size: int) -> DELBERTForSequenceClassification:
@@ -407,11 +938,12 @@ def train_classifier_loop(
     scheduler = get_cosine_schedule_with_warmup(optim, warmup_steps, total_steps)
     print(f"Total steps: {total_steps},  warmup steps: {warmup_steps}")
 
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    run_dir = get_run_dir()
+    os.makedirs(run_dir, exist_ok=True)
     best_metric = -float("inf")
     best_epoch = -1
     epochs_without_improve = 0
-    best_ckpt_path = os.path.join(CHECKPOINT_DIR, f"{run_name}_best.pt")
+    best_ckpt_path = os.path.join(run_dir, f"{run_name}_best.pt")
 
     print(f"\n--- Classifier training ({NUM_EPOCHS} epochs, batch_size={BATCH_SIZE}, lr={LEARNING_RATE}) ---")
     for epoch in range(1, NUM_EPOCHS + 1):
@@ -486,11 +1018,22 @@ def train_classifier_loop(
     for k, v in test_metrics.items():
         print(f"  test_{k}: {v:.4f}")
 
+    run_dir = get_run_dir()
+    predictions_path = os.path.join(run_dir, "predictions_test.csv")
     pd.DataFrame({"label": labels, "pred": preds, "prob_active": probs}).to_csv(
-        PREDICTIONS_CSV, index=False
+        predictions_path, index=False
     )
-    print(f"\nSaved test predictions to {PREDICTIONS_CSV}")
+    print(f"\nSaved test predictions to {predictions_path}")
     print(f"Best checkpoint: {best_ckpt_path}")
+
+    # Diagnostic plots — hit / enrichment / p-value curves on the test set
+    print("\n--- Generating diagnostic plots ---")
+    make_diagnostic_plots(labels, probs, run_dir, title=RUN_NAME)
+
+    # Test metrics table — single-row results.csv
+    print("\n--- Computing test metrics table ---")
+    metrics_table = compute_test_metrics_table(labels, preds, probs, K=AREA_HITS_K)
+    save_results_csv(metrics_table, run_dir)
 
 
 def mlm_pretrain_loop(model, train_loader, val_loader, device, autocast_dtype):
@@ -550,12 +1093,14 @@ def mlm_pretrain_loop(model, train_loader, val_loader, device, autocast_dtype):
         print(f"  MLM Epoch {epoch:2d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f}")
 
     # Save MLM-pretrained encoder
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    run_dir = get_run_dir()
+    os.makedirs(run_dir, exist_ok=True)
+    mlm_ckpt_path = os.path.join(run_dir, "mlm_pretrained.pt")
     torch.save({
         "model_state_dict": model.state_dict(),
         "config": model.config.to_dict(),
-    }, MLM_CHECKPOINT_PATH)
-    print(f"\nMLM checkpoint saved to {MLM_CHECKPOINT_PATH}")
+    }, mlm_ckpt_path)
+    print(f"\nMLM checkpoint saved to {mlm_ckpt_path}")
     return model
 
 
@@ -583,13 +1128,21 @@ def _make_loaders_for_classification(train_df, test_df, tokenizer, label_col, to
     seq_lens = [len(s["input_ids"]) for s in train_ds.samples]
     print(f"Train seq lengths: min={min(seq_lens)}, max={max(seq_lens)}, mean={np.mean(seq_lens):.0f}")
 
-    collator = MolecularCollator(pad_token_id=tokenizer.pad_token_id)
+    # Span shuffling is only applied during training; eval stays deterministic.
+    train_collator = MolecularCollator(
+        pad_token_id=tokenizer.pad_token_id,
+        span_shuffle_probability=SPAN_SHUFFLE_PROBABILITY,
+    )
+    eval_collator = MolecularCollator(pad_token_id=tokenizer.pad_token_id)
     pin_memory = device.type == "cuda"
-    common = dict(num_workers=NUM_WORKERS, pin_memory=pin_memory, persistent_workers=NUM_WORKERS > 0,
-                  collate_fn=collator)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, **common)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, **common)
-    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, **common)
+    dl_kwargs = dict(num_workers=NUM_WORKERS, pin_memory=pin_memory,
+                     persistent_workers=NUM_WORKERS > 0)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                              collate_fn=train_collator, **dl_kwargs)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
+                            collate_fn=eval_collator, **dl_kwargs)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False,
+                             collate_fn=eval_collator, **dl_kwargs)
     return train_loader, val_loader, test_loader
 
 
@@ -611,11 +1164,11 @@ def run_from_scratch(device, autocast_dtype):
     print(f"Train+val class balance: {train_df[label_col].value_counts().to_dict()}")
     print(f"Test class balance:      {test_df[label_col].value_counts().to_dict()}")
 
-    tokenizer = build_binary_tokenizer()
-    print(f"Vocab size: {tokenizer.vocab_size}")
+    tokenizer = build_tokenizer_for_mode(df_for_count_vocab=train_df)
+    print(f"Vocab size: {tokenizer.vocab_size}  |  token_format: {TOKEN_FORMAT}")
 
     train_loader, val_loader, test_loader = _make_loaders_for_classification(
-        train_df, test_df, tokenizer, label_col, token_format="binary", device=device
+        train_df, test_df, tokenizer, label_col, token_format=TOKEN_FORMAT, device=device
     )
 
     model = build_classifier_from_scratch(tokenizer.vocab_size).to(device)
@@ -670,8 +1223,8 @@ def run_pretrain_finetune(device, autocast_dtype):
     pretrain_df = pd.read_parquet(PRETRAIN_PARQUET)
     print(f"Pretrain corpus: {len(pretrain_df):,} molecules (labels ignored)")
 
-    tokenizer = build_binary_tokenizer()
-    print(f"Vocab size: {tokenizer.vocab_size}")
+    tokenizer = build_tokenizer_for_mode(df_for_count_vocab=pretrain_df)
+    print(f"Vocab size: {tokenizer.vocab_size}  |  token_format: {TOKEN_FORMAT}")
 
     # Internal split for MLM val loss monitoring
     pre_train_idx, pre_val_idx = train_test_split(
@@ -683,21 +1236,30 @@ def run_pretrain_finetune(device, autocast_dtype):
     mlm_val_df = pretrain_df.iloc[pre_val_idx].reset_index(drop=True)
 
     mlm_train_ds = MolDataset(mlm_train_df, tokenizer, FP_TYPES, label_col=None,
-                              max_length=MAX_POSITION_EMBEDDINGS, token_format="binary")
+                              max_length=MAX_POSITION_EMBEDDINGS, token_format=TOKEN_FORMAT)
     mlm_val_ds = MolDataset(mlm_val_df, tokenizer, FP_TYPES, label_col=None,
-                            max_length=MAX_POSITION_EMBEDDINGS, token_format="binary")
+                            max_length=MAX_POSITION_EMBEDDINGS, token_format=TOKEN_FORMAT)
 
-    mlm_collator = MolecularCollator(
+    mlm_train_collator = MolecularCollator(
+        pad_token_id=tokenizer.pad_token_id,
+        mask_token_id=tokenizer.mask_token_id,
+        mlm_probability=MLM_PROBABILITY,
+        vocab_size=tokenizer.vocab_size,
+        span_shuffle_probability=SPAN_SHUFFLE_PROBABILITY,
+    )
+    mlm_eval_collator = MolecularCollator(
         pad_token_id=tokenizer.pad_token_id,
         mask_token_id=tokenizer.mask_token_id,
         mlm_probability=MLM_PROBABILITY,
         vocab_size=tokenizer.vocab_size,
     )
     pin_memory = device.type == "cuda"
-    mlm_common = dict(num_workers=NUM_WORKERS, pin_memory=pin_memory,
-                      persistent_workers=NUM_WORKERS > 0, collate_fn=mlm_collator)
-    mlm_train_loader = DataLoader(mlm_train_ds, batch_size=MLM_BATCH_SIZE, shuffle=True, **mlm_common)
-    mlm_val_loader = DataLoader(mlm_val_ds, batch_size=MLM_BATCH_SIZE, shuffle=False, **mlm_common)
+    dl_kwargs = dict(num_workers=NUM_WORKERS, pin_memory=pin_memory,
+                     persistent_workers=NUM_WORKERS > 0)
+    mlm_train_loader = DataLoader(mlm_train_ds, batch_size=MLM_BATCH_SIZE, shuffle=True,
+                                  collate_fn=mlm_train_collator, **dl_kwargs)
+    mlm_val_loader = DataLoader(mlm_val_ds, batch_size=MLM_BATCH_SIZE, shuffle=False,
+                                collate_fn=mlm_eval_collator, **dl_kwargs)
 
     mlm_model = build_mlm_from_scratch(tokenizer.vocab_size).to(device)
     print(f"MLM model parameters: {sum(p.numel() for p in mlm_model.parameters()):,}")
@@ -736,7 +1298,7 @@ def run_pretrain_finetune(device, autocast_dtype):
     print(f"Classifier parameters: total={total:,}  trainable={trainable:,}  ({100 * trainable / total:.2f}% via LoRA)")
 
     train_loader, val_loader, test_loader = _make_loaders_for_classification(
-        train_df, test_df, tokenizer, label_col, token_format="binary", device=device,
+        train_df, test_df, tokenizer, label_col, token_format=TOKEN_FORMAT, device=device,
     )
 
     train_classifier_loop(
@@ -750,6 +1312,8 @@ def run_pretrain_finetune(device, autocast_dtype):
 # ===========================================================================
 
 def main():
+    setup_run()
+
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 

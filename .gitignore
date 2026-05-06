@@ -21,6 +21,13 @@ processed_data/
 outputs/
 wandb/
 lightning_logs/
+runs/
+checkpoints/
+predictions_test.csv
+
+# Local data files (large parquets etc.)
+data/*.parquet
+!data/WDR91_10-examples.parquet
 
 # Evaluation artifacts
 cache/
