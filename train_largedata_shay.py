@@ -136,6 +136,10 @@ LOCAL_ATTENTION = 128
 HIDDEN_DROPOUT_PROB = 0.1
 ATTENTION_DROPOUT_PROB = 0.1
 USE_SEGMENT_EMBEDDINGS = True
+# Position-encoding mode within segments. Paper sets this to "none" so the
+# model relies on segment embeddings (not absolute position) to distinguish
+# fingerprint types. Default in DELBERTConfig is "absolute".
+SEGMENT_POSITION_ENCODING = "none"
 
 # ---------------------------------------------------------------------------
 # Classification head (paper defaults)
@@ -250,6 +254,7 @@ def _collect_settings() -> dict:
             "hidden_dropout_prob": HIDDEN_DROPOUT_PROB,
             "attention_probs_dropout_prob": ATTENTION_DROPOUT_PROB,
             "use_segment_embeddings": USE_SEGMENT_EMBEDDINGS,
+            "segment_position_encoding": SEGMENT_POSITION_ENCODING,
         },
         "classification_head": {
             "num_labels": NUM_LABELS,
@@ -844,6 +849,7 @@ def build_classifier_from_scratch(vocab_size: int) -> DELBERTForSequenceClassifi
         classifier_dropout=CLASSIFIER_DROPOUT,
         classifier_pooling=CLASSIFIER_POOLING,
         use_segment_embeddings=USE_SEGMENT_EMBEDDINGS,
+        segment_position_encoding=SEGMENT_POSITION_ENCODING,
     )
     return DELBERTForSequenceClassification(config, num_labels=NUM_LABELS)
 
@@ -861,6 +867,7 @@ def build_mlm_from_scratch(vocab_size: int) -> DELBERTForMLM:
         hidden_dropout_prob=HIDDEN_DROPOUT_PROB,
         attention_probs_dropout_prob=ATTENTION_DROPOUT_PROB,
         use_segment_embeddings=USE_SEGMENT_EMBEDDINGS,
+        segment_position_encoding=SEGMENT_POSITION_ENCODING,
     )
     return DELBERTForMLM(config)
 

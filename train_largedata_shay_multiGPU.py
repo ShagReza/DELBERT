@@ -55,6 +55,7 @@ from train_largedata_shay import (
     HIDDEN_SIZE, NUM_HIDDEN_LAYERS, NUM_ATTENTION_HEADS, INTERMEDIATE_SIZE,
     MAX_POSITION_EMBEDDINGS, GLOBAL_ROPE_THETA, LOCAL_ATTENTION,
     HIDDEN_DROPOUT_PROB, ATTENTION_DROPOUT_PROB, USE_SEGMENT_EMBEDDINGS,
+    SEGMENT_POSITION_ENCODING,
     # Classifier head
     NUM_LABELS, CLASSIFIER_DROPOUT, CLASSIFIER_POOLING, POS_CLASS_WEIGHT,
     # LoRA
@@ -165,6 +166,7 @@ def _collect_settings():
             "hidden_dropout_prob": HIDDEN_DROPOUT_PROB,
             "attention_probs_dropout_prob": ATTENTION_DROPOUT_PROB,
             "use_segment_embeddings": USE_SEGMENT_EMBEDDINGS,
+            "segment_position_encoding": SEGMENT_POSITION_ENCODING,
         },
         "classification_head": {
             "num_labels": NUM_LABELS,
