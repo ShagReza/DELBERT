@@ -44,7 +44,8 @@ from delbert.data.transforms import MolecularCollator
 # Re-import everything else from the single-GPU script so settings stay in sync.
 from train_largedata_shay import (
     # Mode constants & switch
-    MODE_A_FROM_SCRATCH, MODE_B_FROM_HF, MODE_C_PRETRAIN_FINETUNE, TRAIN_MODE,
+    MODE_A_FROM_SCRATCH, MODE_B_FROM_HF, MODE_C_PRETRAIN_FINETUNE,
+    MODE_D_HF_THEN_MLM_FINETUNE, TRAIN_MODE,
     # Run identity & paths
     RUN_NAME, RUNS_DIR,
     TRAIN_PARQUET, TEST_PARQUET, PRETRAIN_PARQUET, HF_MODEL_ID,
@@ -73,7 +74,7 @@ from train_largedata_shay import (
     make_diagnostic_plots, compute_test_metrics_table, save_results_csv,
     build_binary_tokenizer, build_count_tokenizer, build_tokenizer_for_mode,
     build_classifier_from_scratch, build_mlm_from_scratch,
-    load_hf_classifier, copy_encoder_weights,
+    load_hf_classifier, copy_encoder_weights, build_mlm_from_hf_classifier,
 )
 
 
@@ -715,6 +716,127 @@ def run_pretrain_finetune(device, autocast_dtype):
     )
 
 
+def run_hf_then_mlm_finetune(device, autocast_dtype):
+    """MODE_D: HF weights -> continued MLM on PRETRAIN_PARQUET -> LoRA finetune. DDP version."""
+    rprint("\n" + "=" * 60)
+    rprint(f"MODE D: HF ({HF_MODEL_ID}) -> MLM on PRETRAIN_PARQUET -> LoRA finetune (DDP)")
+    rprint("=" * 60)
+
+    # ---- Load HF model on rank 0 first; cache shared across ranks ----
+    if is_rank0():
+        hf_cls_model, tokenizer, token_format = load_hf_classifier(HF_MODEL_ID)
+    barrier()
+    if not is_rank0():
+        hf_cls_model, tokenizer, token_format = load_hf_classifier(HF_MODEL_ID)
+
+    rprint(f"Tokenizer vocab: {tokenizer.vocab_size}  |  token_format: {token_format}")
+
+    # ---- Stage 1: continued MLM on PRETRAIN_PARQUET ----
+    rprint(f"\n[Stage 1] MLM pretraining on {PRETRAIN_PARQUET}")
+    rprint("Note: starting from HF-pretrained encoder. Consider lowering")
+    rprint("      MLM_LEARNING_RATE (e.g. 5e-5) and MLM_NUM_EPOCHS (e.g. 10-20).")
+    pretrain_df = pd.read_parquet(PRETRAIN_PARQUET)
+    rprint(f"Pretrain corpus: {len(pretrain_df):,} molecules (labels ignored)")
+
+    mlm_model = build_mlm_from_hf_classifier(hf_cls_model).to(device)
+    rprint(f"MLM model parameters: {sum(p.numel() for p in mlm_model.parameters()):,}")
+
+    del hf_cls_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    pre_train_idx, pre_val_idx = train_test_split(
+        np.arange(len(pretrain_df)), test_size=MLM_VAL_FRACTION, random_state=SEED,
+    )
+    mlm_train_df = pretrain_df.iloc[pre_train_idx].reset_index(drop=True)
+    mlm_val_df = pretrain_df.iloc[pre_val_idx].reset_index(drop=True)
+
+    mlm_train_ds = MolDataset(
+        mlm_train_df, tokenizer, FP_TYPES, label_col=None,
+        max_length=MAX_POSITION_EMBEDDINGS, token_format=token_format,
+    )
+    mlm_val_ds = MolDataset(
+        mlm_val_df, tokenizer, FP_TYPES, label_col=None,
+        max_length=MAX_POSITION_EMBEDDINGS, token_format=token_format,
+    )
+
+    mlm_train_collator = MolecularCollator(
+        pad_token_id=tokenizer.pad_token_id,
+        mask_token_id=tokenizer.mask_token_id,
+        mlm_probability=MLM_PROBABILITY,
+        vocab_size=tokenizer.vocab_size,
+        span_shuffle_probability=SPAN_SHUFFLE_PROBABILITY,
+    )
+    mlm_eval_collator = MolecularCollator(
+        pad_token_id=tokenizer.pad_token_id,
+        mask_token_id=tokenizer.mask_token_id,
+        mlm_probability=MLM_PROBABILITY,
+        vocab_size=tokenizer.vocab_size,
+    )
+    pin_memory = device.type == "cuda"
+
+    if is_distributed():
+        mlm_train_sampler = DistributedSampler(mlm_train_ds, shuffle=True, drop_last=False)
+    else:
+        mlm_train_sampler = None
+    mlm_train_loader = DataLoader(
+        mlm_train_ds, batch_size=MLM_BATCH_SIZE, sampler=mlm_train_sampler,
+        shuffle=(mlm_train_sampler is None), collate_fn=mlm_train_collator,
+        num_workers=NUM_WORKERS, pin_memory=pin_memory,
+        persistent_workers=NUM_WORKERS > 0,
+    )
+    mlm_val_loader = DataLoader(
+        mlm_val_ds, batch_size=MLM_BATCH_SIZE, shuffle=False,
+        collate_fn=mlm_eval_collator, num_workers=NUM_WORKERS,
+        pin_memory=pin_memory, persistent_workers=NUM_WORKERS > 0,
+    )
+
+    mlm_model = mlm_pretrain_loop(
+        mlm_model, mlm_train_loader, mlm_train_sampler, mlm_val_loader,
+        device, autocast_dtype,
+    )
+
+    # ---- Stage 2: LoRA classifier finetune on TRAIN_PARQUET ----
+    rprint(f"\n[Stage 2] Classifier finetuning on {TRAIN_PARQUET} with LoRA")
+    train_df = pd.read_parquet(TRAIN_PARQUET)
+    test_df = pd.read_parquet(TEST_PARQUET)
+    rprint(f"Train+val: {len(train_df):,} from {TRAIN_PARQUET}")
+    rprint(f"Test:      {len(test_df):,} from {TEST_PARQUET}")
+
+    label_col = detect_label_column(train_df)
+    rprint(f"Label column: '{label_col}'")
+    rprint(f"Train+val class balance: {train_df[label_col].value_counts().to_dict()}")
+
+    from delbert.models.delbert_model import DELBERTForSequenceClassification
+    cls_model = DELBERTForSequenceClassification(mlm_model.config, num_labels=NUM_LABELS).to(device)
+    copy_encoder_weights(mlm_model, cls_model)
+    rprint("Copied encoder + segment-embedding weights from MLM model into classifier.")
+
+    from delbert.models.finetuning_strategies import get_finetuning_strategy
+    strategy = get_finetuning_strategy(
+        "lora",
+        r=LORA_R, lora_alpha=LORA_ALPHA, lora_dropout=LORA_DROPOUT,
+        target_modules=LORA_TARGET_MODULES,
+    )
+    strategy.apply(cls_model)
+
+    total = sum(p.numel() for p in cls_model.parameters())
+    trainable = sum(p.numel() for p in cls_model.parameters() if p.requires_grad)
+    rprint(
+        f"Classifier parameters: total={total:,}  trainable={trainable:,}  "
+        f"({100 * trainable / total:.2f}% via LoRA)"
+    )
+
+    train_loader, val_loader, test_loader, train_sampler = make_classification_loaders(
+        train_df, test_df, tokenizer, label_col, token_format=token_format, device=device,
+    )
+
+    train_classifier_loop(
+        cls_model, train_loader, val_loader, test_loader, train_sampler,
+        device, autocast_dtype, cls_model.config.to_dict(), run_name="mode_d",
+    )
+
+
 # ===========================================================================
 # Main
 # ===========================================================================
@@ -748,10 +870,13 @@ def main():
         run_from_hf(device, autocast_dtype)
     elif TRAIN_MODE == MODE_C_PRETRAIN_FINETUNE:
         run_pretrain_finetune(device, autocast_dtype)
+    elif TRAIN_MODE == MODE_D_HF_THEN_MLM_FINETUNE:
+        run_hf_then_mlm_finetune(device, autocast_dtype)
     else:
         raise ValueError(
-            f"Unknown TRAIN_MODE: {TRAIN_MODE!r}. "
-            f"Choose: {MODE_A_FROM_SCRATCH}, {MODE_B_FROM_HF}, {MODE_C_PRETRAIN_FINETUNE}"
+            f"Unknown TRAIN_MODE: {TRAIN_MODE!r}. Choose: "
+            f"{MODE_A_FROM_SCRATCH}, {MODE_B_FROM_HF}, "
+            f"{MODE_C_PRETRAIN_FINETUNE}, {MODE_D_HF_THEN_MLM_FINETUNE}"
         )
 
     if is_distributed():

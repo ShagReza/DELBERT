@@ -20,6 +20,18 @@ DELBERT classification training with three selectable strategies (TRAIN_MODE).
                + classifier head on TRAIN_PARQUET.
     Matches the paper's main recipe.
 
+  MODE_D_HF_THEN_MLM_FINETUNE
+    Three-step "domain-adaptive pretraining":
+      Step 0: Load encoder weights from a published HF checkpoint (HF_MODEL_ID),
+              uses HF tokenizer (count format).
+      Step 1: Continue MLM training on PRETRAIN_PARQUET, starting from the
+              HF-pretrained encoder rather than random init.
+      Step 2: Build a classifier model, copy encoder weights from Step 1,
+              apply LoRA adapters, and train on TRAIN_PARQUET.
+    Useful when your unlabeled corpus is similar to but not identical to what
+    the published model was pretrained on. Recommended: set MLM_LEARNING_RATE
+    lower (e.g. 5e-5) and MLM_NUM_EPOCHS smaller (e.g. 10-20) for adaptation.
+
 All modes share the same evaluation: best-val checkpoint is selected on
 val_pr_auc, and the final test set is scored once at the end.
 
@@ -77,6 +89,7 @@ from delbert.models.delbert_model import (
 MODE_A_FROM_SCRATCH = "from_scratch"
 MODE_B_FROM_HF = "from_hf"
 MODE_C_PRETRAIN_FINETUNE = "pretrain_finetune"
+MODE_D_HF_THEN_MLM_FINETUNE = "hf_then_mlm_finetune"
 
 TRAIN_MODE = MODE_A_FROM_SCRATCH
 # ===========================================================================
@@ -920,6 +933,21 @@ def copy_encoder_weights(src_mlm: DELBERTForMLM, dst_cls: DELBERTForSequenceClas
         )
 
 
+def build_mlm_from_hf_classifier(hf_classifier: DELBERTForSequenceClassification) -> DELBERTForMLM:
+    """Build a DELBERTForMLM with encoder weights copied from an HF-loaded classifier.
+
+    The MLM head is freshly initialized (the classifier didn't have one). The
+    config is reused so vocab size, hidden size, segment settings all match.
+    """
+    mlm_model = DELBERTForMLM(hf_classifier.config)
+    mlm_model.encoder.load_state_dict(hf_classifier.encoder.state_dict())
+    src_seg = getattr(hf_classifier, "segment_embedding_layer", None)
+    dst_seg = getattr(mlm_model, "segment_embedding_layer", None)
+    if src_seg is not None and dst_seg is not None:
+        dst_seg.load_state_dict(src_seg.state_dict())
+    return mlm_model
+
+
 # ===========================================================================
 # Training loops
 # ===========================================================================
@@ -1314,6 +1342,109 @@ def run_pretrain_finetune(device, autocast_dtype):
     )
 
 
+def run_hf_then_mlm_finetune(device, autocast_dtype):
+    """MODE_D: HF weights -> continued MLM on PRETRAIN_PARQUET -> LoRA finetune."""
+    print("\n" + "=" * 60)
+    print(f"MODE D: HF ({HF_MODEL_ID}) -> MLM on PRETRAIN_PARQUET -> LoRA finetune")
+    print("=" * 60)
+
+    # ---- Load HF model: get encoder weights + tokenizer + token_format ----
+    print(f"\nLoading HF checkpoint {HF_MODEL_ID}...")
+    hf_cls_model, tokenizer, token_format = load_hf_classifier(HF_MODEL_ID)
+    print(f"Tokenizer vocab: {tokenizer.vocab_size}  |  token_format: {token_format}")
+
+    # ---- Stage 1: continued MLM on PRETRAIN_PARQUET ----
+    print(f"\n[Stage 1] MLM pretraining on {PRETRAIN_PARQUET}")
+    print("Note: starting from HF-pretrained encoder. Consider lowering")
+    print("      MLM_LEARNING_RATE (e.g. 5e-5) and MLM_NUM_EPOCHS (e.g. 10-20).")
+    pretrain_df = pd.read_parquet(PRETRAIN_PARQUET)
+    print(f"Pretrain corpus: {len(pretrain_df):,} molecules (labels ignored)")
+
+    mlm_model = build_mlm_from_hf_classifier(hf_cls_model).to(device)
+    print(f"MLM model parameters: {sum(p.numel() for p in mlm_model.parameters()):,}")
+
+    # Free HF classifier — only the encoder weights mattered.
+    del hf_cls_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    pre_train_idx, pre_val_idx = train_test_split(
+        np.arange(len(pretrain_df)), test_size=MLM_VAL_FRACTION, random_state=SEED,
+    )
+    mlm_train_df = pretrain_df.iloc[pre_train_idx].reset_index(drop=True)
+    mlm_val_df = pretrain_df.iloc[pre_val_idx].reset_index(drop=True)
+
+    mlm_train_ds = MolDataset(
+        mlm_train_df, tokenizer, FP_TYPES, label_col=None,
+        max_length=MAX_POSITION_EMBEDDINGS, token_format=token_format,
+    )
+    mlm_val_ds = MolDataset(
+        mlm_val_df, tokenizer, FP_TYPES, label_col=None,
+        max_length=MAX_POSITION_EMBEDDINGS, token_format=token_format,
+    )
+
+    mlm_train_collator = MolecularCollator(
+        pad_token_id=tokenizer.pad_token_id,
+        mask_token_id=tokenizer.mask_token_id,
+        mlm_probability=MLM_PROBABILITY,
+        vocab_size=tokenizer.vocab_size,
+        span_shuffle_probability=SPAN_SHUFFLE_PROBABILITY,
+    )
+    mlm_eval_collator = MolecularCollator(
+        pad_token_id=tokenizer.pad_token_id,
+        mask_token_id=tokenizer.mask_token_id,
+        mlm_probability=MLM_PROBABILITY,
+        vocab_size=tokenizer.vocab_size,
+    )
+    pin_memory = device.type == "cuda"
+    dl_kwargs = dict(num_workers=NUM_WORKERS, pin_memory=pin_memory,
+                     persistent_workers=NUM_WORKERS > 0)
+    mlm_train_loader = DataLoader(mlm_train_ds, batch_size=MLM_BATCH_SIZE, shuffle=True,
+                                  collate_fn=mlm_train_collator, **dl_kwargs)
+    mlm_val_loader = DataLoader(mlm_val_ds, batch_size=MLM_BATCH_SIZE, shuffle=False,
+                                collate_fn=mlm_eval_collator, **dl_kwargs)
+
+    mlm_model = mlm_pretrain_loop(mlm_model, mlm_train_loader, mlm_val_loader,
+                                  device, autocast_dtype)
+
+    # ---- Stage 2: LoRA classifier finetune on TRAIN_PARQUET ----
+    print(f"\n[Stage 2] Classifier finetuning on {TRAIN_PARQUET} with LoRA")
+    train_df = pd.read_parquet(TRAIN_PARQUET)
+    test_df = pd.read_parquet(TEST_PARQUET)
+    print(f"Train+val: {len(train_df):,} from {TRAIN_PARQUET}")
+    print(f"Test:      {len(test_df):,} from {TEST_PARQUET}")
+
+    label_col = detect_label_column(train_df)
+    print(f"Label column: '{label_col}'")
+    print(f"Train+val class balance: {train_df[label_col].value_counts().to_dict()}")
+
+    cls_model = DELBERTForSequenceClassification(mlm_model.config, num_labels=NUM_LABELS).to(device)
+    copy_encoder_weights(mlm_model, cls_model)
+    print("Copied encoder + segment-embedding weights from MLM model into classifier.")
+
+    from delbert.models.finetuning_strategies import get_finetuning_strategy
+    strategy = get_finetuning_strategy(
+        "lora",
+        r=LORA_R, lora_alpha=LORA_ALPHA, lora_dropout=LORA_DROPOUT,
+        target_modules=LORA_TARGET_MODULES,
+    )
+    strategy.apply(cls_model)
+
+    total = sum(p.numel() for p in cls_model.parameters())
+    trainable = sum(p.numel() for p in cls_model.parameters() if p.requires_grad)
+    print(f"Classifier parameters: total={total:,}  trainable={trainable:,}  "
+          f"({100 * trainable / total:.2f}% via LoRA)")
+
+    train_loader, val_loader, test_loader = _make_loaders_for_classification(
+        train_df, test_df, tokenizer, label_col, token_format=token_format, device=device,
+    )
+
+    train_classifier_loop(
+        cls_model, train_loader, val_loader, test_loader,
+        device, autocast_dtype, cls_model.config.to_dict(), run_name="mode_d",
+    )
+
+
 # ===========================================================================
 # Main
 # ===========================================================================
@@ -1341,10 +1472,13 @@ def main():
         run_from_hf(device, autocast_dtype)
     elif TRAIN_MODE == MODE_C_PRETRAIN_FINETUNE:
         run_pretrain_finetune(device, autocast_dtype)
+    elif TRAIN_MODE == MODE_D_HF_THEN_MLM_FINETUNE:
+        run_hf_then_mlm_finetune(device, autocast_dtype)
     else:
         raise ValueError(
-            f"Unknown TRAIN_MODE: {TRAIN_MODE!r}. "
-            f"Choose from: {MODE_A_FROM_SCRATCH}, {MODE_B_FROM_HF}, {MODE_C_PRETRAIN_FINETUNE}"
+            f"Unknown TRAIN_MODE: {TRAIN_MODE!r}. Choose from: "
+            f"{MODE_A_FROM_SCRATCH}, {MODE_B_FROM_HF}, "
+            f"{MODE_C_PRETRAIN_FINETUNE}, {MODE_D_HF_THEN_MLM_FINETUNE}"
         )
 
 
