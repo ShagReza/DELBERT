@@ -676,6 +676,17 @@ def run_pretrain_finetune(device, autocast_dtype):
         device, autocast_dtype,
     )
 
+    # Free Stage-1 resources before Stage 2 reads the test parquet — see the
+    # single-GPU script for rationale (system RAM OOM mitigation).
+    import gc
+    del mlm_train_loader, mlm_val_loader, mlm_train_ds, mlm_val_ds
+    del mlm_train_collator, mlm_eval_collator
+    del pretrain_df, mlm_train_df, mlm_val_df
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    rprint("Stage 1 resources released.")
+
     # ---- Stage 2: Classifier finetune with LoRA ----
     rprint(f"\n[Stage 2] Classifier finetuning on {TRAIN_PARQUET} with LoRA")
     train_df = pd.read_parquet(TRAIN_PARQUET)
@@ -690,6 +701,12 @@ def run_pretrain_finetune(device, autocast_dtype):
     cls_model = build_classifier_from_scratch(tokenizer.vocab_size).to(device)
     copy_encoder_weights(mlm_model, cls_model)
     rprint("Copied encoder + segment-embedding weights from MLM model into classifier.")
+
+    # MLM model's job is done — its weights are now in cls_model.encoder.
+    del mlm_model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     from delbert.models.finetuning_strategies import get_finetuning_strategy
     strategy = get_finetuning_strategy(

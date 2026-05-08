@@ -130,7 +130,7 @@ LABEL_CANDIDATES = ["LABEL", "label", "ENRICHED", "enriched", "target", "active"
 #             (fp_type, bit, count) triples that appear >= COUNT_MIN_TOKEN_FREQUENCY
 #             times. Each active bit becomes "{FP}_{bit}_{count}". Matches the
 #             paper and the published HF checkpoints; ~5-30K extra tokens.
-TOKEN_FORMAT = "binary"
+TOKEN_FORMAT = "count"
 COUNT_MIN_TOKEN_FREQUENCY = 1
 
 # ---------------------------------------------------------------------------
@@ -1302,6 +1302,19 @@ def run_pretrain_finetune(device, autocast_dtype):
     mlm_model = mlm_pretrain_loop(mlm_model, mlm_train_loader, mlm_val_loader,
                                   device, autocast_dtype)
 
+    # Free Stage-1 resources before Stage 2 reads the (potentially huge) test
+    # parquet — otherwise system RAM can OOM, especially on small instances
+    # like g2-standard-4 (16 GB RAM). Pre-tokenized MLM datasets, persistent
+    # DataLoader workers, and the pretrain DataFrame can hold ~1 GB combined.
+    import gc
+    del mlm_train_loader, mlm_val_loader, mlm_train_ds, mlm_val_ds
+    del mlm_train_collator, mlm_eval_collator
+    del pretrain_df, mlm_train_df, mlm_val_df
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print("Stage 1 resources released.")
+
     # ---- Stage 2: Classifier finetune with LoRA ----
     print(f"\n[Stage 2] Classifier finetuning on {TRAIN_PARQUET} with LoRA")
     train_df = pd.read_parquet(TRAIN_PARQUET)
@@ -1316,6 +1329,12 @@ def run_pretrain_finetune(device, autocast_dtype):
     cls_model = build_classifier_from_scratch(tokenizer.vocab_size).to(device)
     copy_encoder_weights(mlm_model, cls_model)
     print("Copied encoder + segment-embedding weights from MLM model into classifier.")
+
+    # MLM model's job is done — its weights are now in cls_model.encoder.
+    del mlm_model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # Apply LoRA via the repo's strategy pattern (requires `pip install peft`)
     from delbert.models.finetuning_strategies import get_finetuning_strategy
