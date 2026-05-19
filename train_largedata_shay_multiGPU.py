@@ -66,15 +66,16 @@ from train_largedata_shay import (
     GRADIENT_CLIP_VAL, NUM_WORKERS,
     VAL_FRACTION, EARLY_STOP_PATIENCE, EARLY_STOP_MIN_DELTA, MONITOR_METRIC,
     MLM_NUM_EPOCHS, MLM_BATCH_SIZE, MLM_LEARNING_RATE,
-    MLM_PROBABILITY, MLM_VAL_FRACTION,
+    MLM_PROBABILITY, MLM_VAL_FRACTION, MLM_CHECKPOINT_TO_LOAD,
     SPAN_SHUFFLE_PROBABILITY,
     USE_BF16_ON_GPU, AREA_HITS_K,
     # Helpers
     detect_label_column, MolDataset, make_optimizer, evaluate_classifier,
     make_diagnostic_plots, compute_test_metrics_table, save_results_csv,
-    build_binary_tokenizer, build_count_tokenizer, build_tokenizer_for_mode,
+    build_tokenizer_for_mode,
     build_classifier_from_scratch, build_mlm_from_scratch,
     load_hf_classifier, copy_encoder_weights, build_mlm_from_hf_classifier,
+    load_mlm_from_checkpoint,
 )
 
 
@@ -203,6 +204,7 @@ def _collect_settings():
             "learning_rate": MLM_LEARNING_RATE,
             "mlm_probability": MLM_PROBABILITY,
             "mlm_val_fraction": MLM_VAL_FRACTION,
+            "checkpoint_to_load": MLM_CHECKPOINT_TO_LOAD,
         },
         "augmentation": {
             "span_shuffle_probability": SPAN_SHUFFLE_PROBABILITY,
@@ -614,78 +616,86 @@ def run_pretrain_finetune(device, autocast_dtype):
     rprint("MODE C: MLM pretrain -> LoRA finetune - multi-GPU DDP")
     rprint("=" * 60)
 
-    # ---- Stage 1: MLM pretraining ----
-    rprint(f"\n[Stage 1] MLM pretraining on {PRETRAIN_PARQUET}")
+    # ---- Stage 1: MLM pretraining (or resume from checkpoint) ----
     pretrain_df = pd.read_parquet(PRETRAIN_PARQUET)
     rprint(f"Pretrain corpus: {len(pretrain_df):,} molecules (labels ignored)")
-
     tokenizer = build_tokenizer_for_mode(df_for_count_vocab=pretrain_df)
     rprint(f"Vocab size: {tokenizer.vocab_size}  |  token_format: {TOKEN_FORMAT}")
-
-    pre_train_idx, pre_val_idx = train_test_split(
-        np.arange(len(pretrain_df)), test_size=MLM_VAL_FRACTION, random_state=SEED,
-    )
-    mlm_train_df = pretrain_df.iloc[pre_train_idx].reset_index(drop=True)
-    mlm_val_df = pretrain_df.iloc[pre_val_idx].reset_index(drop=True)
-
-    mlm_train_ds = MolDataset(
-        mlm_train_df, tokenizer, FP_TYPES, label_col=None,
-        max_length=MAX_POSITION_EMBEDDINGS, token_format=TOKEN_FORMAT,
-    )
-    mlm_val_ds = MolDataset(
-        mlm_val_df, tokenizer, FP_TYPES, label_col=None,
-        max_length=MAX_POSITION_EMBEDDINGS, token_format=TOKEN_FORMAT,
-    )
-
-    mlm_train_collator = MolecularCollator(
-        pad_token_id=tokenizer.pad_token_id,
-        mask_token_id=tokenizer.mask_token_id,
-        mlm_probability=MLM_PROBABILITY,
-        vocab_size=tokenizer.vocab_size,
-        span_shuffle_probability=SPAN_SHUFFLE_PROBABILITY,
-    )
-    mlm_eval_collator = MolecularCollator(
-        pad_token_id=tokenizer.pad_token_id,
-        mask_token_id=tokenizer.mask_token_id,
-        mlm_probability=MLM_PROBABILITY,
-        vocab_size=tokenizer.vocab_size,
-    )
-    pin_memory = device.type == "cuda"
-
-    if is_distributed():
-        mlm_train_sampler = DistributedSampler(mlm_train_ds, shuffle=True, drop_last=False)
-    else:
-        mlm_train_sampler = None
-    mlm_train_loader = DataLoader(
-        mlm_train_ds, batch_size=MLM_BATCH_SIZE, sampler=mlm_train_sampler,
-        shuffle=(mlm_train_sampler is None), collate_fn=mlm_train_collator,
-        num_workers=NUM_WORKERS, pin_memory=pin_memory,
-        persistent_workers=NUM_WORKERS > 0,
-    )
-    mlm_val_loader = DataLoader(
-        mlm_val_ds, batch_size=MLM_BATCH_SIZE, shuffle=False,
-        collate_fn=mlm_eval_collator, num_workers=NUM_WORKERS,
-        pin_memory=pin_memory, persistent_workers=NUM_WORKERS > 0,
-    )
-
-    mlm_model = build_mlm_from_scratch(tokenizer.vocab_size).to(device)
-    rprint(f"MLM model parameters: {sum(p.numel() for p in mlm_model.parameters()):,}")
-
-    mlm_model = mlm_pretrain_loop(
-        mlm_model, mlm_train_loader, mlm_train_sampler, mlm_val_loader,
-        device, autocast_dtype,
-    )
-
-    # Free Stage-1 resources before Stage 2 reads the test parquet — see the
-    # single-GPU script for rationale (system RAM OOM mitigation).
     import gc
-    del mlm_train_loader, mlm_val_loader, mlm_train_ds, mlm_val_ds
-    del mlm_train_collator, mlm_eval_collator
-    del pretrain_df, mlm_train_df, mlm_val_df
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    rprint("Stage 1 resources released.")
+
+    if MLM_CHECKPOINT_TO_LOAD:
+        rprint(f"\n[Stage 1] SKIPPED — loading MLM checkpoint from {MLM_CHECKPOINT_TO_LOAD}")
+        mlm_model = load_mlm_from_checkpoint(MLM_CHECKPOINT_TO_LOAD, device)
+        rprint(f"MLM model parameters: {sum(p.numel() for p in mlm_model.parameters()):,}")
+        del pretrain_df
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    else:
+        rprint(f"\n[Stage 1] MLM pretraining on {PRETRAIN_PARQUET}")
+
+        pre_train_idx, pre_val_idx = train_test_split(
+            np.arange(len(pretrain_df)), test_size=MLM_VAL_FRACTION, random_state=SEED,
+        )
+        mlm_train_df = pretrain_df.iloc[pre_train_idx].reset_index(drop=True)
+        mlm_val_df = pretrain_df.iloc[pre_val_idx].reset_index(drop=True)
+
+        mlm_train_ds = MolDataset(
+            mlm_train_df, tokenizer, FP_TYPES, label_col=None,
+            max_length=MAX_POSITION_EMBEDDINGS, token_format=TOKEN_FORMAT,
+        )
+        mlm_val_ds = MolDataset(
+            mlm_val_df, tokenizer, FP_TYPES, label_col=None,
+            max_length=MAX_POSITION_EMBEDDINGS, token_format=TOKEN_FORMAT,
+        )
+
+        mlm_train_collator = MolecularCollator(
+            pad_token_id=tokenizer.pad_token_id,
+            mask_token_id=tokenizer.mask_token_id,
+            mlm_probability=MLM_PROBABILITY,
+            vocab_size=tokenizer.vocab_size,
+            span_shuffle_probability=SPAN_SHUFFLE_PROBABILITY,
+        )
+        mlm_eval_collator = MolecularCollator(
+            pad_token_id=tokenizer.pad_token_id,
+            mask_token_id=tokenizer.mask_token_id,
+            mlm_probability=MLM_PROBABILITY,
+            vocab_size=tokenizer.vocab_size,
+        )
+        pin_memory = device.type == "cuda"
+
+        if is_distributed():
+            mlm_train_sampler = DistributedSampler(mlm_train_ds, shuffle=True, drop_last=False)
+        else:
+            mlm_train_sampler = None
+        mlm_train_loader = DataLoader(
+            mlm_train_ds, batch_size=MLM_BATCH_SIZE, sampler=mlm_train_sampler,
+            shuffle=(mlm_train_sampler is None), collate_fn=mlm_train_collator,
+            num_workers=NUM_WORKERS, pin_memory=pin_memory,
+            persistent_workers=NUM_WORKERS > 0,
+        )
+        mlm_val_loader = DataLoader(
+            mlm_val_ds, batch_size=MLM_BATCH_SIZE, shuffle=False,
+            collate_fn=mlm_eval_collator, num_workers=NUM_WORKERS,
+            pin_memory=pin_memory, persistent_workers=NUM_WORKERS > 0,
+        )
+
+        mlm_model = build_mlm_from_scratch(tokenizer.vocab_size).to(device)
+        rprint(f"MLM model parameters: {sum(p.numel() for p in mlm_model.parameters()):,}")
+
+        mlm_model = mlm_pretrain_loop(
+            mlm_model, mlm_train_loader, mlm_train_sampler, mlm_val_loader,
+            device, autocast_dtype,
+        )
+
+        # Free Stage-1 resources before Stage 2 reads the test parquet.
+        del mlm_train_loader, mlm_val_loader, mlm_train_ds, mlm_val_ds
+        del mlm_train_collator, mlm_eval_collator
+        del pretrain_df, mlm_train_df, mlm_val_df
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        rprint("Stage 1 resources released.")
 
     # ---- Stage 2: Classifier finetune with LoRA ----
     rprint(f"\n[Stage 2] Classifier finetuning on {TRAIN_PARQUET} with LoRA")
