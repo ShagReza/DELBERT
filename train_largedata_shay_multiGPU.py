@@ -234,9 +234,12 @@ def setup_run():
 # DDP-aware data loaders
 # ===========================================================================
 
-def make_classification_loaders(train_df, test_df, tokenizer, label_col,
-                                token_format, device):
-    """Train uses DistributedSampler; val/test are plain (rank-0 only iterates them)."""
+def make_classification_loaders(train_df, tokenizer, label_col, token_format, device):
+    """Train uses DistributedSampler; val is plain (rank-0 only iterates it).
+
+    The test DataLoader is built later by build_test_loader_from_path() — only
+    once training has finished and memory is at its leanest.
+    """
     train_idx, val_idx = train_test_split(
         np.arange(len(train_df)),
         test_size=VAL_FRACTION,
@@ -250,7 +253,6 @@ def make_classification_loaders(train_df, test_df, tokenizer, label_col,
     max_len = MAX_POSITION_EMBEDDINGS
     train_ds = MolDataset(train_df_split, tokenizer, FP_TYPES, label_col, max_len, token_format)
     val_ds = MolDataset(val_df_split, tokenizer, FP_TYPES, label_col, max_len, token_format)
-    test_ds = MolDataset(test_df, tokenizer, FP_TYPES, label_col, max_len, token_format)
 
     seq_lens = [len(s["input_ids"]) for s in train_ds.samples]
     rprint(f"Train seq lengths: min={min(seq_lens)}, max={max(seq_lens)}, mean={np.mean(seq_lens):.0f}")
@@ -278,19 +280,39 @@ def make_classification_loaders(train_df, test_df, tokenizer, label_col,
         num_workers=NUM_WORKERS, pin_memory=pin_memory,
         persistent_workers=NUM_WORKERS > 0,
     )
-    test_loader = DataLoader(
-        test_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=eval_collator,
-        num_workers=NUM_WORKERS, pin_memory=pin_memory,
-        persistent_workers=NUM_WORKERS > 0,
+    return train_loader, val_loader, train_sampler
+
+
+def build_test_loader_from_path(test_parquet_path, tokenizer, label_col, token_format, device):
+    """Read the test parquet (column-filtered) and build a DataLoader for it.
+
+    Called after classifier training completes — see _make_loaders_for_classification
+    docstring in train_largedata_shay.py for the deferred-read rationale.
+    """
+    cols_needed = FP_TYPES + [label_col]
+    rprint(f"Reading {test_parquet_path} (columns: {cols_needed})...")
+    test_df = pd.read_parquet(test_parquet_path, columns=cols_needed)
+    rprint(f"Test:      {len(test_df):,} from {test_parquet_path}")
+    rprint(f"Test class balance: {test_df[label_col].value_counts().to_dict()}")
+
+    test_ds = MolDataset(
+        test_df, tokenizer, FP_TYPES, label_col,
+        MAX_POSITION_EMBEDDINGS, token_format,
     )
-    return train_loader, val_loader, test_loader, train_sampler
+    eval_collator = MolecularCollator(pad_token_id=tokenizer.pad_token_id)
+    pin_memory = device.type == "cuda"
+    return DataLoader(
+        test_ds, batch_size=BATCH_SIZE, shuffle=False,
+        collate_fn=eval_collator, num_workers=NUM_WORKERS,
+        pin_memory=pin_memory, persistent_workers=NUM_WORKERS > 0,
+    )
 
 
 # ===========================================================================
 # DDP-aware classifier training loop
 # ===========================================================================
 
-def train_classifier_loop(model, train_loader, val_loader, test_loader,
+def train_classifier_loop(model, train_loader, val_loader, test_loader_builder,
                           train_sampler, device, autocast_dtype, config_dict,
                           run_name="run"):
     class_weights = torch.tensor([1.0, POS_CLASS_WEIGHT], device=device)
@@ -416,6 +438,10 @@ def train_classifier_loop(model, train_loader, val_loader, test_loader,
         base_model = model.module if hasattr(model, "module") else model
         ckpt = torch.load(best_ckpt_path, map_location=device)
         base_model.load_state_dict(ckpt["model_state_dict"])
+
+        # Build test loader NOW — training done, optimizer state gone, memory leanest.
+        rprint("\n--- Building test loader (deferred read) ---")
+        test_loader = test_loader_builder()
 
         rprint("\n--- Final test-set evaluation ---")
         test_metrics, probs, preds, labels = evaluate_classifier(
@@ -544,30 +570,30 @@ def run_from_scratch(device, autocast_dtype):
     rprint("=" * 60)
 
     train_df = pd.read_parquet(TRAIN_PARQUET)
-    test_df = pd.read_parquet(TEST_PARQUET)
     rprint(f"Train+val: {len(train_df):,} from {TRAIN_PARQUET}")
-    rprint(f"Test:      {len(test_df):,} from {TEST_PARQUET}")
 
     label_col = detect_label_column(train_df)
-    if label_col not in test_df.columns:
-        raise ValueError(f"Label column '{label_col}' missing from test parquet")
     rprint(f"Label column: '{label_col}'")
     rprint(f"Train+val class balance: {train_df[label_col].value_counts().to_dict()}")
-    rprint(f"Test class balance:      {test_df[label_col].value_counts().to_dict()}")
 
     tokenizer = build_tokenizer_for_mode(df_for_count_vocab=train_df)
     rprint(f"Vocab size: {tokenizer.vocab_size}  |  token_format: {TOKEN_FORMAT}")
 
-    train_loader, val_loader, test_loader, train_sampler = make_classification_loaders(
-        train_df, test_df, tokenizer, label_col, token_format=TOKEN_FORMAT, device=device,
+    train_loader, val_loader, train_sampler = make_classification_loaders(
+        train_df, tokenizer, label_col, token_format=TOKEN_FORMAT, device=device,
     )
 
     model = build_classifier_from_scratch(tokenizer.vocab_size).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     rprint(f"Model parameters: {n_params:,}")
 
+    def _test_loader_builder():
+        return build_test_loader_from_path(
+            TEST_PARQUET, tokenizer, label_col, TOKEN_FORMAT, device,
+        )
+
     train_classifier_loop(
-        model, train_loader, val_loader, test_loader, train_sampler,
+        model, train_loader, val_loader, _test_loader_builder, train_sampler,
         device, autocast_dtype, model.config.to_dict(), run_name="mode_a",
     )
 
@@ -578,13 +604,9 @@ def run_from_hf(device, autocast_dtype):
     rprint("=" * 60)
 
     train_df = pd.read_parquet(TRAIN_PARQUET)
-    test_df = pd.read_parquet(TEST_PARQUET)
     rprint(f"Train+val: {len(train_df):,} from {TRAIN_PARQUET}")
-    rprint(f"Test:      {len(test_df):,} from {TEST_PARQUET}")
 
     label_col = detect_label_column(train_df)
-    if label_col not in test_df.columns:
-        raise ValueError(f"Label column '{label_col}' missing from test parquet")
     rprint(f"Label column: '{label_col}'")
 
     # Rank 0 downloads first; others reuse the on-disk cache (single-node Workbench).
@@ -601,12 +623,17 @@ def run_from_hf(device, autocast_dtype):
         f"|  vocab: {tokenizer.vocab_size}"
     )
 
-    train_loader, val_loader, test_loader, train_sampler = make_classification_loaders(
-        train_df, test_df, tokenizer, label_col, token_format=token_format, device=device,
+    train_loader, val_loader, train_sampler = make_classification_loaders(
+        train_df, tokenizer, label_col, token_format=token_format, device=device,
     )
 
+    def _test_loader_builder():
+        return build_test_loader_from_path(
+            TEST_PARQUET, tokenizer, label_col, token_format, device,
+        )
+
     train_classifier_loop(
-        model, train_loader, val_loader, test_loader, train_sampler,
+        model, train_loader, val_loader, _test_loader_builder, train_sampler,
         device, autocast_dtype, model.config.to_dict(), run_name="mode_b",
     )
 
@@ -700,9 +727,7 @@ def run_pretrain_finetune(device, autocast_dtype):
     # ---- Stage 2: Classifier finetune with LoRA ----
     rprint(f"\n[Stage 2] Classifier finetuning on {TRAIN_PARQUET} with LoRA")
     train_df = pd.read_parquet(TRAIN_PARQUET)
-    test_df = pd.read_parquet(TEST_PARQUET)
     rprint(f"Train+val: {len(train_df):,} from {TRAIN_PARQUET}")
-    rprint(f"Test:      {len(test_df):,} from {TEST_PARQUET}")
 
     label_col = detect_label_column(train_df)
     rprint(f"Label column: '{label_col}'")
@@ -733,12 +758,17 @@ def run_pretrain_finetune(device, autocast_dtype):
         f"({100 * trainable / total:.2f}% via LoRA)"
     )
 
-    train_loader, val_loader, test_loader, train_sampler = make_classification_loaders(
-        train_df, test_df, tokenizer, label_col, token_format=TOKEN_FORMAT, device=device,
+    train_loader, val_loader, train_sampler = make_classification_loaders(
+        train_df, tokenizer, label_col, token_format=TOKEN_FORMAT, device=device,
     )
 
+    def _test_loader_builder():
+        return build_test_loader_from_path(
+            TEST_PARQUET, tokenizer, label_col, TOKEN_FORMAT, device,
+        )
+
     train_classifier_loop(
-        cls_model, train_loader, val_loader, test_loader, train_sampler,
+        cls_model, train_loader, val_loader, _test_loader_builder, train_sampler,
         device, autocast_dtype, cls_model.config.to_dict(), run_name="mode_c",
     )
 
@@ -826,9 +856,7 @@ def run_hf_then_mlm_finetune(device, autocast_dtype):
     # ---- Stage 2: LoRA classifier finetune on TRAIN_PARQUET ----
     rprint(f"\n[Stage 2] Classifier finetuning on {TRAIN_PARQUET} with LoRA")
     train_df = pd.read_parquet(TRAIN_PARQUET)
-    test_df = pd.read_parquet(TEST_PARQUET)
     rprint(f"Train+val: {len(train_df):,} from {TRAIN_PARQUET}")
-    rprint(f"Test:      {len(test_df):,} from {TEST_PARQUET}")
 
     label_col = detect_label_column(train_df)
     rprint(f"Label column: '{label_col}'")
@@ -854,12 +882,17 @@ def run_hf_then_mlm_finetune(device, autocast_dtype):
         f"({100 * trainable / total:.2f}% via LoRA)"
     )
 
-    train_loader, val_loader, test_loader, train_sampler = make_classification_loaders(
-        train_df, test_df, tokenizer, label_col, token_format=token_format, device=device,
+    train_loader, val_loader, train_sampler = make_classification_loaders(
+        train_df, tokenizer, label_col, token_format=token_format, device=device,
     )
 
+    def _test_loader_builder():
+        return build_test_loader_from_path(
+            TEST_PARQUET, tokenizer, label_col, token_format, device,
+        )
+
     train_classifier_loop(
-        cls_model, train_loader, val_loader, test_loader, train_sampler,
+        cls_model, train_loader, val_loader, _test_loader_builder, train_sampler,
         device, autocast_dtype, cls_model.config.to_dict(), run_name="mode_d",
     )
 
