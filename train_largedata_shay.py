@@ -179,6 +179,10 @@ LORA_TARGET_MODULES = ["Wqkv"]
 SEED = 42
 NUM_EPOCHS = 10
 BATCH_SIZE = 50
+# Inference-only batch (used for final test-set eval). Can be much larger than
+# BATCH_SIZE because no gradients / optimizer state are stored. Speeds up the
+# 460K-row test sweep significantly. Lower this if you OOM on a smaller GPU.
+TEST_BATCH_SIZE = 128
 LEARNING_RATE = 5e-4
 WEIGHT_DECAY = 0.01
 WARMUP_RATIO = 0.1
@@ -292,6 +296,7 @@ def _collect_settings() -> dict:
             "seed": SEED,
             "num_epochs": NUM_EPOCHS,
             "batch_size": BATCH_SIZE,
+            "test_batch_size": TEST_BATCH_SIZE,
             "learning_rate": LEARNING_RATE,
             "weight_decay": WEIGHT_DECAY,
             "warmup_ratio": WARMUP_RATIO,
@@ -1239,8 +1244,9 @@ def build_test_loader_from_path(test_parquet_path, tokenizer, label_col, token_f
     )
     eval_collator = MolecularCollator(pad_token_id=tokenizer.pad_token_id)
     pin_memory = device.type == "cuda"
+    print(f"Test DataLoader batch_size={TEST_BATCH_SIZE} (inference-only).")
     return DataLoader(
-        test_ds, batch_size=BATCH_SIZE, shuffle=False,
+        test_ds, batch_size=TEST_BATCH_SIZE, shuffle=False,
         collate_fn=eval_collator, num_workers=NUM_WORKERS,
         pin_memory=pin_memory, persistent_workers=NUM_WORKERS > 0,
     )

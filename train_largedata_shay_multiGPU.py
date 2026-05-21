@@ -62,8 +62,8 @@ from train_largedata_shay import (
     # LoRA
     LORA_R, LORA_ALPHA, LORA_DROPOUT, LORA_TARGET_MODULES,
     # Training
-    SEED, NUM_EPOCHS, BATCH_SIZE, LEARNING_RATE, WEIGHT_DECAY, WARMUP_RATIO,
-    GRADIENT_CLIP_VAL, NUM_WORKERS,
+    SEED, NUM_EPOCHS, BATCH_SIZE, TEST_BATCH_SIZE, LEARNING_RATE, WEIGHT_DECAY,
+    WARMUP_RATIO, GRADIENT_CLIP_VAL, NUM_WORKERS,
     VAL_FRACTION, EARLY_STOP_PATIENCE, EARLY_STOP_MIN_DELTA, MONITOR_METRIC,
     MLM_NUM_EPOCHS, MLM_BATCH_SIZE, MLM_LEARNING_RATE,
     MLM_PROBABILITY, MLM_VAL_FRACTION, MLM_CHECKPOINT_TO_LOAD,
@@ -185,6 +185,7 @@ def _collect_settings():
             "num_epochs": NUM_EPOCHS,
             "batch_size_per_gpu": BATCH_SIZE,
             "effective_batch_size": BATCH_SIZE * get_world_size(),
+            "test_batch_size": TEST_BATCH_SIZE,
             "learning_rate": LEARNING_RATE,
             "weight_decay": WEIGHT_DECAY,
             "warmup_ratio": WARMUP_RATIO,
@@ -301,8 +302,9 @@ def build_test_loader_from_path(test_parquet_path, tokenizer, label_col, token_f
     )
     eval_collator = MolecularCollator(pad_token_id=tokenizer.pad_token_id)
     pin_memory = device.type == "cuda"
+    rprint(f"Test DataLoader batch_size={TEST_BATCH_SIZE} (inference-only).")
     return DataLoader(
-        test_ds, batch_size=BATCH_SIZE, shuffle=False,
+        test_ds, batch_size=TEST_BATCH_SIZE, shuffle=False,
         collate_fn=eval_collator, num_workers=NUM_WORKERS,
         pin_memory=pin_memory, persistent_workers=NUM_WORKERS > 0,
     )
