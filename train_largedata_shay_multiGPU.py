@@ -23,6 +23,7 @@ hyperparameter, edit it once in that file. (The only DDP-specific knob is the
 launch flag --nproc_per_node.)
 """
 
+import gc
 import json
 import os
 import sys
@@ -430,38 +431,53 @@ def train_classifier_loop(model, train_loader, val_loader, test_loader_builder,
             break
         barrier()
 
-    # Final test eval — rank 0 only writes artifacts.
+    # Free optimizer + scheduler before returning — function-local, but they
+    # hold significant GPU memory that the test eval doesn't need.
+    del optim, scheduler
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    if is_rank0():
+        rprint(f"\nTraining done. Best checkpoint: {best_ckpt_path}")
+        rprint(f"  best_epoch={best_epoch}, val_{MONITOR_METRIC}={best_metric:.4f}")
+
+    barrier()
+    return best_ckpt_path
+
+
+def run_final_test_eval_ddp(model, best_ckpt_path, test_loader_builder,
+                            device, autocast_dtype, run_dir, title=""):
+    """Rank-0 only: load best checkpoint, build test loader, evaluate, save artifacts."""
     barrier()
     if is_rank0():
-        rprint(
-            f"\n--- Loading best checkpoint (epoch {best_epoch}, "
-            f"val_{MONITOR_METRIC}={best_metric:.4f}) ---"
-        )
+        rprint(f"\n--- Loading best checkpoint ---")
+        rprint(f"  Path: {best_ckpt_path}")
         base_model = model.module if hasattr(model, "module") else model
         ckpt = torch.load(best_ckpt_path, map_location=device)
         base_model.load_state_dict(ckpt["model_state_dict"])
+        del ckpt
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-        # Build test loader NOW — training done, optimizer state gone, memory leanest.
         rprint("\n--- Building test loader (deferred read) ---")
         test_loader = test_loader_builder()
 
         rprint("\n--- Final test-set evaluation ---")
         test_metrics, probs, preds, labels = evaluate_classifier(
-            base_model, test_loader, device, autocast_dtype
+            base_model, test_loader, device, autocast_dtype,
         )
         for k, v in test_metrics.items():
             print(f"  test_{k}: {v:.4f}")
 
-        run_dir = get_run_dir()
         predictions_path = os.path.join(run_dir, "predictions_test.csv")
         pd.DataFrame({"label": labels, "pred": preds, "prob_active": probs}).to_csv(
-            predictions_path, index=False
+            predictions_path, index=False,
         )
         print(f"\nSaved test predictions to {predictions_path}")
-        print(f"Best checkpoint: {best_ckpt_path}")
 
         print("\n--- Generating diagnostic plots ---")
-        make_diagnostic_plots(labels, probs, run_dir, title=RUN_NAME)
+        make_diagnostic_plots(labels, probs, run_dir, title=title)
 
         print("\n--- Computing test metrics table ---")
         metrics_table = compute_test_metrics_table(labels, preds, probs, K=AREA_HITS_K)
@@ -594,9 +610,21 @@ def run_from_scratch(device, autocast_dtype):
             TEST_PARQUET, tokenizer, label_col, TOKEN_FORMAT, device,
         )
 
-    train_classifier_loop(
+    best_ckpt_path = train_classifier_loop(
         model, train_loader, val_loader, _test_loader_builder, train_sampler,
         device, autocast_dtype, model.config.to_dict(), run_name="mode_a",
+    )
+
+    # Free train-side resources before test eval (RAM OOM mitigation).
+    del train_loader, val_loader, train_sampler, train_df
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    rprint("Training-side resources released.")
+
+    run_final_test_eval_ddp(
+        model, best_ckpt_path, _test_loader_builder,
+        device, autocast_dtype, get_run_dir(), title=RUN_NAME,
     )
 
 
@@ -634,9 +662,20 @@ def run_from_hf(device, autocast_dtype):
             TEST_PARQUET, tokenizer, label_col, token_format, device,
         )
 
-    train_classifier_loop(
+    best_ckpt_path = train_classifier_loop(
         model, train_loader, val_loader, _test_loader_builder, train_sampler,
         device, autocast_dtype, model.config.to_dict(), run_name="mode_b",
+    )
+
+    del train_loader, val_loader, train_sampler, train_df
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    rprint("Training-side resources released.")
+
+    run_final_test_eval_ddp(
+        model, best_ckpt_path, _test_loader_builder,
+        device, autocast_dtype, get_run_dir(), title=RUN_NAME,
     )
 
 
@@ -769,9 +808,20 @@ def run_pretrain_finetune(device, autocast_dtype):
             TEST_PARQUET, tokenizer, label_col, TOKEN_FORMAT, device,
         )
 
-    train_classifier_loop(
+    best_ckpt_path = train_classifier_loop(
         cls_model, train_loader, val_loader, _test_loader_builder, train_sampler,
         device, autocast_dtype, cls_model.config.to_dict(), run_name="mode_c",
+    )
+
+    del train_loader, val_loader, train_sampler, train_df
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    rprint("Training-side resources released.")
+
+    run_final_test_eval_ddp(
+        cls_model, best_ckpt_path, _test_loader_builder,
+        device, autocast_dtype, get_run_dir(), title=RUN_NAME,
     )
 
 
@@ -893,9 +943,20 @@ def run_hf_then_mlm_finetune(device, autocast_dtype):
             TEST_PARQUET, tokenizer, label_col, token_format, device,
         )
 
-    train_classifier_loop(
+    best_ckpt_path = train_classifier_loop(
         cls_model, train_loader, val_loader, _test_loader_builder, train_sampler,
         device, autocast_dtype, cls_model.config.to_dict(), run_name="mode_d",
+    )
+
+    del train_loader, val_loader, train_sampler, train_df
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    rprint("Training-side resources released.")
+
+    run_final_test_eval_ddp(
+        cls_model, best_ckpt_path, _test_loader_builder,
+        device, autocast_dtype, get_run_dir(), title=RUN_NAME,
     )
 
 
